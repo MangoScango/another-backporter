@@ -16,6 +16,10 @@ from pathlib import Path
 
 from ps5backport import acquire as acq
 from ps5backport.build import BuildError, build_fakelib_set, build_title
+from ps5backport.callsites import CallsiteRuleError
+from ps5backport.fakelib_patches import FakelibPatchError
+from ps5backport.translations import TranslationError
+from ps5backport.rules import RuleSet
 from ps5backport.config import TIERS, Config
 from ps5backport.diag import diag_title
 from ps5backport.exportdb import ExportDB
@@ -29,6 +33,9 @@ def load_db(cfg):
     return db
 
 
+def named_patches(args):
+    """The named fakelib patch ids asked for with --apply."""
+    return [i for i in args.apply.split(",") if i]
 def fakelibs_for(args, cfg):
     """The title's fakelib list from --plan, or the explicit --fakelibs."""
     if args.plan:
@@ -74,7 +81,8 @@ def cmd_build(args, cfg):
     fakelibs = fakelibs_for(args, cfg)
     report = build_title(cfg, tier, registry, db, args.dump, args.out, fakelibs,
                          allow_unreviewed=args.allow_unreviewed,
-                         unpeg_shim=args.unpeg_shim)
+                         unpeg_shim=args.unpeg_shim,
+                         rules=RuleSet.load(cfg), apply=named_patches(args))
     _print_build_summary(args.out, report)
 
 
@@ -89,7 +97,8 @@ def cmd_diag(args, cfg):
         traps.setdefault(name, []).append(int(va, 16))
     report = diag_title(cfg, tier, registry, db, args.dump, args.out, fakelibs,
                         traps=traps,
-                        allow_unreviewed=args.allow_unreviewed)
+                        allow_unreviewed=args.allow_unreviewed,
+                        rules=RuleSet.load(cfg), apply=named_patches(args))
     _print_build_summary(args.out, report)
     print(Path(args.out, "sites.txt").read_text())
 
@@ -99,11 +108,20 @@ def _print_build_summary(out, report):
     unreviewed = sum(s["status"] != "reviewed" for s in applied)
     cased = sum(1 for f in report["files"].values()
                 for l in f["retargeted"] if l.startswith("case "))
+    patched = sum(len(r["sites"]) for f in report["files"].values()
+                  for r in f.get("callsite_rules", ()))
+    module_patches = sum(len(f.get("fakelib_patches", ())) for f in report["files"].values())
+    translated = sum(len(r["sites"]) for f in report["files"].values()
+                     for r in f.get("translations", ()))
     print(f"wrote {out}: {len(report['files'])} files "
           f"({len(report['unchanged'])} unchanged, skipped), "
           f"{len(applied)} stubs ({unreviewed} unreviewed), "
-          f"{cased} case fixes, {len(report['case_warnings'])} case warnings, "
+          f"{cased} case fixes, {patched} call-site patches, "
+          f"{module_patches} fakelib patches, {translated} constant translations, "
+          f"{len(report['case_warnings'])} case warnings, "
           f"{len(report['unshipped'])} unshipped imports left unbound")
+    for line in report.get("warnings", ()):
+        print(f"warning: {line}", file=sys.stderr)
 
 
 def cmd_run(args, cfg):
@@ -115,7 +133,8 @@ def cmd_run(args, cfg):
     plan, report = run_title(cfg, tier, registry, db, args.src, args.out,
                              title=args.title,
                              allow_unreviewed=args.allow_unreviewed,
-                             unpeg_shim=args.unpeg_shim)
+                             unpeg_shim=args.unpeg_shim,
+                             rules=RuleSet.load(cfg), apply=named_patches(args))
     title = next(iter(plan.titles))
     print(f"plan {title}: {sorted(plan.titles[title]['fakelibs'])}")
     _print_build_summary(args.out, report)
@@ -166,6 +185,8 @@ def main(argv=None):
     p.add_argument("--title", help="title id (default: source name)")
     p.add_argument("--tier", default="7xx", choices=sorted(TIERS))
     p.add_argument("--allow-unreviewed", action="store_true")
+    p.add_argument("--apply", default="", metavar="ID[,ID]",
+                   help="named fakelib patches to apply (see registry/fakelib-patches.csv)")
     p.add_argument("--unpeg-shim", action="store_true",
                    help="experimental: VideoOut fakelib unpegs VRR for VRR-aware apps")
     p.set_defaults(run=cmd_run)
@@ -180,6 +201,8 @@ def main(argv=None):
                        help="comma-separated module names")
         p.add_argument("--plan", help="plan JSON to take the title's fakelibs from")
         p.add_argument("--allow-unreviewed", action="store_true")
+        p.add_argument("--apply", default="", metavar="ID[,ID]",
+                       help="named fakelib patches to apply (see registry/fakelib-patches.csv)")
         p.add_argument("--unpeg-shim", action="store_true",
                        help="experimental: VideoOut fakelib unpegs VRR for VRR-aware apps")
         if name == "diag":
@@ -191,7 +214,7 @@ def main(argv=None):
     cfg = Config.default()
     try:
         args.run(args, cfg)
-    except (UnresolvedImports, RegistryError, BuildError) as e:
+    except (UnresolvedImports, RegistryError, BuildError, CallsiteRuleError, FakelibPatchError, TranslationError) as e:
         sys.exit(f"error:\n{e}")
 
 

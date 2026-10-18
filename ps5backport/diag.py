@@ -23,7 +23,7 @@ def trap_at(vaddrs):
 
 
 def diag_title(cfg, tier, registry, db, dump, out, fakelibs, traps,
-               allow_unreviewed=False):
+               allow_unreviewed=False, rules=None, apply=()):
     """Build title with ud2 traps; writes sites.txt.
 
     traps maps an executable's basename to a list of vaddrs and is required —
@@ -34,7 +34,8 @@ def diag_title(cfg, tier, registry, db, dump, out, fakelibs, traps,
                          "(a load-failure branch, or the null check after a symbol lookup)")
     hooks = {name: trap_at(vaddrs) for name, vaddrs in traps.items()}
     report = build_title(cfg, tier, registry, db, dump, out, fakelibs,
-                         allow_unreviewed=allow_unreviewed, hooks=hooks)
+                         allow_unreviewed=allow_unreviewed, hooks=hooks,
+                         rules=rules, apply=apply)
     lines = []
     for name in sorted(traps):
         rel = next((r for r in report.get("hook_sites", {}) if Path(r).name == name), None)

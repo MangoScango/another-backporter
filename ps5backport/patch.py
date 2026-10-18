@@ -272,6 +272,120 @@ class Patcher:
                 at += 1
         raise ValueError(f"{self.path}: no PLT entry for {nid}")
 
+    # mov r32, imm32 for the argument registers a rule may name.
+    ARG_LOADS = {"edi": 0xbf, "esi": 0xbe, "edx": 0xba, "ecx": 0xb9}
+    SITE_WINDOW = 32
+    def call_sites(self, nid, register, value):
+        """Classify every direct call to the import's PLT entry.
+        Returns (matched, unresolved) lists of call-site vaddrs. The argument
+        is read from the last small `mov register, imm32` in the straight-line
+        bytes before the call, provided no call sits between them. A site whose
+        immediate equals value matches; one with another immediate is a valid
+        call and is skipped; any other site is unresolved.
+        """
+        plt = self.plt_for_import(nid)
+        load = self.ARG_LOADS[register]
+        matched, unresolved = [], []
+        for offset, vaddr, size in executable_segments(self.data):
+            at = offset
+            while True:
+                at = self.data.find(b"\xe8", at, offset + size - 4)
+                if at < 0:
+                    break
+                site = vaddr + at - offset
+                at += 1
+                if site + 5 + struct.unpack_from("<i", self.data, at)[0] != plt:
+                    continue
+                window = bytes(self.data[max(offset, at - 1 - self.SITE_WINDOW):at - 1])
+                # A small immediate has three zero high bytes, which screens out
+                # 0xbe bytes that belong to other instructions.
+                loads = [i for i in range(len(window) - 4)
+                         if window[i] == load and window[i + 2:i + 5] == b"\0\0\0"]
+                if not loads:
+                    unresolved.append(site)
+                    continue
+                between = window[loads[-1] + 5:]
+                if b"\xe8" in between or b"\xff\x15" in between:
+                    unresolved.append(site)
+                elif window[loads[-1] + 1] == value:
+                    matched.append(site)
+        return matched, unresolved
+    def ignore_result(self, site):
+        """Make the branch on a call's result always take the success path.
+        Accepts `call; test eax,eax` followed by je/jne, short or near, and
+        rewrites the branch in place: je becomes jmp, jne becomes nops.
+        Returns a log line. Raises ValueError for any other shape.
+        """
+        at = self.module._vaddr_to_offset(site) + 5
+        if bytes(self.data[at:at + 2]) != b"\x85\xc0":
+            raise ValueError(f"{self.path}: call at {site:#x} is not followed by test eax,eax")
+        at += 2
+        op = bytes(self.data[at:at + 2])
+        if op[:1] == b"\x74":                        # je rel8
+            before, after = op[:1], b"\xeb"
+        elif op[:1] == b"\x75":                      # jne rel8
+            before, after = op, b"\x90\x90"
+        elif op == b"\x0f\x84":                      # je rel32
+            before, after = op, b"\x90\xe9"
+        elif op == b"\x0f\x85":                      # jne rel32
+            before, after = bytes(self.data[at:at + 6]), b"\x90" * 6
+        else:
+            raise ValueError(f"{self.path}: call at {site:#x} is not followed by je/jne")
+        self.data[at:at + len(after)] = after
+        line = f"call-site rule at {site:#x}: branch {before.hex()} -> {after.hex()}"
+        self.log.append(line)
+        return line
+    def replace_bytes(self, find, replace, expect):
+        """Replace an exact byte string in the executable segments, in place.
+        Raises ValueError unless find occurs exactly expect times.
+        Returns the vaddrs patched.
+        """
+        hits = []
+        for offset, vaddr, size in executable_segments(self.data):
+            at = offset
+            while True:
+                at = self.data.find(find, at, offset + size)
+                if at < 0:
+                    break
+                hits.append((vaddr + at - offset, at))
+                at += 1
+        if len(hits) != expect:
+            raise ValueError(f"{self.path}: {find.hex()} occurs {len(hits)} times, expected {expect}")
+        for _vaddr, at in hits:
+            self.data[at:at + len(replace)] = replace
+        self.log.append(f"patched {find.hex()} -> {replace.hex()} at "
+                        + ", ".join(f"{v:#x}" for v, _ in hits))
+        return [v for v, _ in hits]
+    def constant_loads(self, constant):
+        """Sites in the executable segments that load constant as an immediate.
+        Returns [(vaddr, size)]: `mov r32, imm32` (size 4, at the immediate)
+        and `movabs r64, imm64` whose two halves both equal constant (size 8).
+        """
+        find = struct.pack("<I", constant)
+        sites = []
+        for offset, vaddr, size in executable_segments(self.data):
+            at = offset + 1
+            while True:
+                at = self.data.find(find, at, offset + size)
+                if at < 0:
+                    break
+                opcode = self.data[at - 1]
+                if 0xb8 <= opcode <= 0xbf:
+                    rex = self.data[at - 2] if at - 2 >= offset else 0
+                    wide = rex & 0x48 == 0x48 and bytes(self.data[at + 4:at + 8]) == find
+                    sites.append((vaddr + at - offset, 8 if wide else 4))
+                    if wide:
+                        at += 4
+                at += 1
+        return sites
+    def translate_constant(self, constant, replacement, sites):
+        """Rewrite the loads constant_loads found; an 8-byte site holds it twice."""
+        new = struct.pack("<I", replacement)
+        for vaddr, size in sites:
+            at = self.module._vaddr_to_offset(vaddr)
+            self.data[at:at + size] = new * (size // 4)
+        self.log.append(f"constant {constant:#x} -> {replacement:#x} at "
+                        + ", ".join(f"{v:#x}" for v, _ in sites))
     def vrr_shims(self, source):
         """Route AddVrrActiveStatusEvent and GetOutputStatusWithVrr through source.
 

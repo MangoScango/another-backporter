@@ -76,6 +76,9 @@ class Config:
     registry: Path    # backport-stubs.csv
     make_fself: Path  # fake-signs every written file
     pub_cmd: Path = None  # prospero-pub-cmd.exe (via wine), needed only for pkg input
+    callsites: Path = None  # callsite-rules.csv
+    fakelib_patches: Path = None  # fakelib-patches.csv
+    translations: Path = None  # constant-translations.csv
     passcode: str = "0" * 32
     source_fw: str = SOURCE_FW
     source_override: dict = field(default_factory=lambda: dict(SOURCE_OVERRIDE))
@@ -93,6 +96,12 @@ class Config:
             make_fself=_env_path("PS5BACKPORT_MAKE_FSELF",
                                  REPO_ROOT / "reference" / "legacy" / "make_fself.py"),
             pub_cmd=_env_path("PS5BACKPORT_PUB_CMD", None),
+            callsites=_env_path("PS5BACKPORT_CALLSITES",
+                                REPO_ROOT / "registry" / "callsite-rules.csv"),
+            fakelib_patches=_env_path("PS5BACKPORT_FAKELIB_PATCHES",
+                                      REPO_ROOT / "registry" / "fakelib-patches.csv"),
+            translations=_env_path("PS5BACKPORT_TRANSLATIONS",
+                                   REPO_ROOT / "registry" / "constant-translations.csv"),
         )
 
     def system_module(self, name, fw=None):

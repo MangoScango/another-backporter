@@ -3,7 +3,8 @@
 A title's folder holds only files that must differ from the game: fakelibs
 under fakelib/, plus game executables whose stamp exceeds the tier or whose
 imports need stubs. Stamps are lowered, never raised. Everything written is
-fake-signed. Nothing is written when the registry refuses any stub — the
+fake-signed. Nothing is written when the registry refuses any stub, or a
+call-site rule, fakelib patch or constant translation does not apply — the
 refusals are collected and reported as one full list first.
 """
 import json
@@ -80,6 +81,105 @@ def _stub_report(registry, placed):
             for addr, pair in sorted(placed.items())}
 
 
+def _callsite_work(rules, level, dump, game_modules, allow_unreviewed=False):
+    """Resolve call-site rules against a title before anything is written.
+    Returns {rel: [(rule, matched sites, unresolved sites)]} for the files the
+    rules touch. Raises BuildError with every refused rule and every matched
+    site whose branch cannot be rewritten in place.
+    """
+    work, refused, unpatchable = {}, [], []
+    for rel, module in game_modules.items():
+        found = rules.applicable(level, set(module.imports))
+        if not found:
+            continue
+        for rule, why in rules.refused(found, allow_unreviewed):
+            refused.append(f"  {rule['library']}:{rule['nid']} ({why}) {rule['name']} — in {rel}")
+        scratch = Patcher(str(dump / rel))
+        for rule in found:
+            matched, unresolved = scratch.call_sites(
+                rule["nid"], rule["register"], rule["value"])
+            for site in matched:
+                try:
+                    Patcher(str(dump / rel)).ignore_result(site)
+                except ValueError as err:
+                    unpatchable.append(f"  {rule['library']}:{rule['nid']} in {rel}: {err}")
+            work.setdefault(rel, []).append((rule, matched, unresolved))
+    if refused or unpatchable:
+        lines = ["call-site rules refused; nothing written:"] + refused + unpatchable
+        raise BuildError("\n".join(lines))
+    return work
+def _fakelib_patch_work(patches, level, plan, allow_unreviewed=False, requested=()):
+    """Resolve fakelib patch rows against the planned fakelibs before writing.
+    Returns {rel: [rule]}. Raises BuildError with every refused row, every
+    requested row that cannot apply, and every row whose bytes do not occur
+    the expected number of times.
+    """
+    shipped = {rel.name for rel, _src, _stubs in plan if rel.parts[0] == "fakelib"}
+    work, problems = {}, patches.problems(level, requested, shipped)
+    for rel, src, _stubs in plan:
+        if rel.parts[0] != "fakelib":
+            continue
+        found = patches.applicable(level, rel.name, requested)
+        for rule, why in patches.refused(found, allow_unreviewed):
+            problems.append(f"  {rule['key']} ({why}) {rule['name']} — in {rel}")
+        for rule in found:
+            try:
+                Patcher(str(src)).replace_bytes(rule["find"], rule["replace"], rule["expect"])
+            except ValueError as err:
+                problems.append(f"  {rule['key']}: {err}")
+        if found:
+            work[rel] = found
+    if problems:
+        raise BuildError("\n".join(["fakelib patches refused; nothing written:"] + problems))
+    return work
+def _translation_work(translations, tier, dump, game_modules, allow_unreviewed=False):
+    """Find the constant loads each translation rewrites, before writing.
+    Returns {rel: [(rule, sites)]} for game files with at least one site.
+    Raises BuildError listing every refused rule.
+    """
+    work, refused = {}, []
+    for rel, module in game_modules.items():
+        words = stamp_words(module)
+        sdk = min(words[0], tier.stamp_ps5) if words else tier.stamp_ps5
+        found = translations.applicable(tier.level, sdk, set(module.imports))
+        if not found:
+            continue
+        for rule, why in translations.refused(found, allow_unreviewed):
+            refused.append(f"  {rule['key']} ({why}) {rule['name']} — in {rel}")
+        scratch = Patcher(str(dump / rel))
+        for rule in found:
+            sites = scratch.constant_loads(rule["constant"])
+            if sites:
+                work.setdefault(rel, []).append((rule, sites))
+    if refused:
+        raise BuildError("\n".join(["constant translations refused; nothing written:"] + refused))
+    return work
+
+
+def _named_patch_warnings(patches, level, requested, plan, game_modules):
+    """One line per named fakelib patch that was not asked for although a game
+    module imports the call it watches."""
+    shipped = {rel.name for rel, _src, _stubs in plan if rel.parts[0] == "fakelib"}
+    out = []
+    for rule in patches.named(level):
+        if rule["id"] in requested or rule["watch"] is None:
+            continue
+        users = sorted(str(rel) for rel, module in game_modules.items()
+                       if rule["watch"] in set(module.imports))
+        if not users:
+            continue
+        note = ("" if rule["module"] in shipped
+                else f" ({rule['module']} is not shipped for this title, so it could not apply)")
+        out.append(f"{rule['id']}: {rule['name']} is available but not applied; "
+                   f"{', '.join(users)} imports {rule['watch'][0]}:{rule['watch'][1]}; "
+                   f"ask for it with --apply {rule['id']}{note}")
+    return out
+def _callsite_report(rule, matched, unresolved):
+    return {"key": f"{rule['library']}:{rule['nid']}", "name": rule["name"],
+            "status": rule["status"], "match": rule["match"],
+            "since": rule["since"], "tells_game": rule["tells_game"],
+            "sites": [f"{s:#x}" for s in matched],
+            "unresolved": [f"{s:#x}" for s in unresolved]}
 def build_fakelib_set(cfg, tier, registry, fakelib_plan, out_dir,
                       allow_unreviewed=False, unpeg_shim=False):
     """Build the tier's fakelibs into out_dir/fakelib/.
@@ -118,8 +218,10 @@ def build_fakelib_set(cfg, tier, registry, fakelib_plan, out_dir,
 
 
 def build_title(cfg, tier, registry, db, dump, out, fakelibs,
-                allow_unreviewed=False, unpeg_shim=False, hooks=None):
+                allow_unreviewed=False, unpeg_shim=False, hooks=None,
+                rules=None, apply=()):
     """Build the backport folder for one title. Returns the report dict.
+    apply names the `named` fakelib patches to apply.
 
     hooks maps an executable's basename to a callable run on its Patcher after
     stubs and case fixes, before signing (the diagnostics mode uses this).
@@ -165,6 +267,29 @@ def build_title(cfg, tier, registry, db, dump, out, fakelibs,
         else:
             unchanged.append(str(rel))
 
+    callsites = (_callsite_work(rules.callsites, tier.level, dump, game_modules,
+                                allow_unreviewed)
+                 if rules and rules.callsites else {})
+    for rel, entries in sorted(callsites.items()):
+        if str(rel) in unchanged and any(matched for _r, matched, _u in entries):
+            unchanged.remove(str(rel))
+            plan.append((rel, dump / rel, set()))
+    translations = (_translation_work(rules.translations, tier, dump, game_modules,
+                                      allow_unreviewed)
+                    if rules and rules.translations else {})
+    for rel in sorted(translations):
+        if str(rel) in unchanged:
+            unchanged.remove(str(rel))
+            plan.append((rel, dump / rel, set()))
+    requested = frozenset(apply)
+    if requested and not (rules and rules.fakelib_patches):
+        raise BuildError("--apply given but no fakelib patch file is loaded")
+    fakelib_patches = (_fakelib_patch_work(rules.fakelib_patches, tier.level, plan,
+                                           allow_unreviewed, requested)
+                       if rules and rules.fakelib_patches else {})
+    named_warnings = (_named_patch_warnings(rules.fakelib_patches, tier.level, requested,
+                                            plan, game_modules)
+                      if rules and rules.fakelib_patches else [])
     shipped = [rel for rel, _, _ in plan if rel.parts[0] != "fakelib"]
     case_warnings = [
         f"{owner} @{off:#x}: {found!r} vs shipped {real!r}"
@@ -180,6 +305,7 @@ def build_title(cfg, tier, registry, db, dump, out, fakelibs,
               "source": cfg.source_fw, "overrides": cfg.source_override,
               "allow_unreviewed": allow_unreviewed, "files": {},
               "unchanged": unchanged, "case_warnings": case_warnings,
+              "applied_by_name": sorted(requested), "warnings": named_warnings,
               "unshipped": [{"library": p[0], "nid": p[1], "in": sorted(files)}
                             for p, files in sorted(unshipped.items())]}
     vrr_src = Path(__file__).with_name("vrr_shim.s")
@@ -196,6 +322,22 @@ def build_title(cfg, tier, registry, db, dump, out, fakelibs,
                         patcher.log.append(f"case {found} -> {real} @{off:#x}")
                     else:
                         case_warnings.append(f"{rel} @{off:#x}: {found!r} vs shipped {real!r}")
+            patched = []
+            for rule in fakelib_patches.get(rel, ()):
+                patcher.replace_bytes(rule["find"], rule["replace"], rule["expect"])
+                patched.append({"key": rule["key"], "name": rule["name"],
+                                "status": rule["status"], "tells_game": rule["tells_game"]})
+            translated = []
+            for rule, sites in translations.get(rel, ()):
+                patcher.translate_constant(rule["constant"], rule["replacement"], sites)
+                translated.append({"key": rule["key"], "name": rule["name"],
+                                   "status": rule["status"], "tells_game": rule["tells_game"],
+                                   "sites": [f"{v:#x}" for v, _ in sites]})
+            applied = []
+            for rule, matched, unresolved in callsites.get(rel, ()):
+                for site in matched:
+                    patcher.ignore_result(site)
+                applied.append(_callsite_report(rule, matched, unresolved))
             if unpeg_shim and rel == Path("fakelib/libSceVideoOut.sprx"):
                 patcher.vrr_shims(str(vrr_src))
             if hooks and rel.name in hooks:
@@ -209,6 +351,9 @@ def build_title(cfg, tier, registry, db, dump, out, fakelibs,
                 "stubs": _stub_report(registry, placed),
                 "retargeted": [l for l in patcher.log if l.startswith(
                     ("retargeted", "unpeg shim", "vrr shims", "case "))],
+                "callsite_rules": applied,
+                "fakelib_patches": patched,
+                "translations": translated,
                 "warnings": [l for l in patcher.log if l.startswith("WARNING")]}
     (out.parent / f"{out.name}-report.json").write_text(json.dumps(report, indent=1))
     if hook_sites:
@@ -217,7 +362,7 @@ def build_title(cfg, tier, registry, db, dump, out, fakelibs,
 
 
 def run_title(cfg, tier, registry, db, src, out, title=None,
-              allow_unreviewed=False, unpeg_shim=False):
+              allow_unreviewed=False, unpeg_shim=False, rules=None, apply=()):
     """End to end for one title: acquire -> unwrap -> plan -> build.
 
     src is a loose dump folder or a .pkg. The title is planned on its own;
@@ -243,7 +388,8 @@ def run_title(cfg, tier, registry, db, src, out, title=None,
     plan_path.write_text(json.dumps(plan.to_json(), indent=1))
     fakelibs = sorted(plan.titles[title]["fakelibs"])
     report = build_title(cfg, tier, registry, db, dump, out, fakelibs,
-                         allow_unreviewed=allow_unreviewed, unpeg_shim=unpeg_shim)
+                         allow_unreviewed=allow_unreviewed, unpeg_shim=unpeg_shim,
+                         rules=rules, apply=apply)
     if failures:
         report["unwrap_failures"] = [{"file": rel, "error": err} for rel, err in failures]
     return plan, report

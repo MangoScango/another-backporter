@@ -1,8 +1,9 @@
 """The firmware export database: which (library, NID) each firmware exports,
 and which system module carries a library.
 
-The CSVs under fwdb/ cover system/common/lib only, so priv/lib exports are
-scanned from the firmware dumps themselves and cached next to the ELF cache.
+The CSVs under fwdb/ cover system/common/lib and a few common_ex libraries, so
+priv/lib exports are scanned from the firmware dumps themselves and cached next
+to the ELF cache.
 """
 import csv
 import pickle
@@ -51,6 +52,11 @@ class ExportDB:
                     (row['module'], row['min_fw'], row['max_fw']))
 
         self.rank = {name: i for i, name in enumerate(self.levels)}
+        # {module filename: [(library, min_fw, max_fw)]}
+        self._carried = {}
+        for library, rows in self.module_table.items():
+            for module, low, high in rows:
+                self._carried.setdefault(module, []).append((library, low, high))
         self._priv = None
 
     def load_priv(self, libs_dir, cache_path):
@@ -75,12 +81,27 @@ class ExportDB:
         """True when firmware level exports (library, nid)."""
         if self._priv is not None and pair in self._priv.get(level, ()):
             return True
+        return self._in_span(pair, level) or self._exported_by_module(pair, level)
+
+    def _in_span(self, pair, level):
         span = self.ranges.get(pair)
         if not span:
             return False
         at = self.rank[level]
         return (self.rank[span[0]] <= at <= self.rank[span[1]]
                 and level not in self.holes.get(pair, ()))
+
+    def _exported_by_module(self, pair, level):
+        """True when the module named for pair's library exports the NID under
+        another of its libraries (libSceSystemService.sprx carries libSceLncUtil).
+        The linker accepts an import of that NID through the module's own name."""
+        library, nid = pair
+        at = self.rank[level]
+        for other, low, high in self._carried.get(f"{library}.sprx", ()):
+            if (other != library and self.rank[low] <= at <= self.rank[high]
+                    and self._in_span((other, nid), level)):
+                return True
+        return False
 
     def carrier(self, library, target):
         """-> (sprx filename a library at target comes from, alternatives)."""

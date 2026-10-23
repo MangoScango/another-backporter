@@ -327,6 +327,7 @@ libScePngParser,libScePngParser.sprx,1.00,13.60
 libScePosix,libkernel.sprx,1.00,13.60
 libScePosix,libkernel_sys.sprx,1.00,13.60
 libScePosix,libkernel_web.sprx,1.00,13.60
+libScePosixForWebKit,libScePosixForWebKit.sprx,3.20,13.60
 libSceProprietaryVoiceChatHelper,libSceProprietaryVoiceChatHelper.native.sprx,4.00,13.60
 libScePs2EmuMenuDialog,libScePs2EmuMenuDialog.sprx,1.00,13.60
 libScePsml,libScePsml.sprx,9.00,13.60

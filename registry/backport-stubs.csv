@@ -1,6 +1,7 @@
 library,nid,name,since,status,stub,tells_game,prior_art
 libSceAvSetting,E7PAHM781GQ,,9.00,reviewed,b8ff002a80c3,returns 0x802a00ff (AvSetting generic error); only reached from the dev-only sceVideoOutSysSetOutputConfig,
 libSceAvSetting,Jhcj4HDIw04,sceAvControlInit2,8.00,reviewed,retarget:s9knR+WWOyI,binds to sceAvControlInit (1.00); the version argument is ignored,
+libSceCoredump,32KQRUK13kI,sceCoredumpWriteUserString,8.00,reviewed,return0,returns 0; the user string is not added to crash dumps,
 libSceDbgAddressSanitizer,AM5dbXp3qbI,__sanitizer_start_switch_fiber,,unreviewed,return0,returns 0; sanitizer bookkeeping is skipped; which only matters in sanitizer builds,BestPig 6xx Fiber: 0
 libSceDbgAddressSanitizer,cYlYsDQY500,__sanitizer_finish_switch_fiber,,unreviewed,return0,returns 0; sanitizer bookkeeping is skipped; which only matters in sanitizer builds,BestPig 6xx Fiber: 0
 libSceDbgAddressSanitizer,jachrbjpHnM,__asan_destroy_fake_stack,,unreviewed,return0,returns 0; sanitizer bookkeeping is skipped; which only matters in sanitizer builds,BestPig 6xx Fiber: 0

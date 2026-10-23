@@ -21,18 +21,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ps5backport.config import Config
 from ps5backport.patch import Patcher
-
-MAGIC = 0xFFAABBCC
-SUCCESS = 0x80000000
-CMD_PROC_LIST, CMD_PROC_READ, CMD_PROC_WRITE, CMD_PROC_MAPS, CMD_PROC_INFO = (
-    0xBDAA0001, 0xBDAA0002, 0xBDAA0003, 0xBDAA0004, 0xBDAA000A)
-CMD_ATTACH, CMD_DETACH, CMD_BREAKPOINT, CMD_GETREGS, CMD_SETREGS, CMD_CONTINUE = (
-    0xBDBB0001, 0xBDBB0002, 0xBDBB0003, 0xBDBB0008, 0xBDBB0009, 0xBDBB0010)
-EVENT_SIZE = 0x4A0
-REG = dict(r15=0x00, r14=0x08, r13=0x10, r12=0x18, r11=0x20, r10=0x28, r9=0x30, r8=0x38,
-           rdi=0x40, rsi=0x48, rbp=0x50, rbx=0x58, rdx=0x60, rcx=0x68, rax=0x70, rip=0x88, rsp=0xA0)
-REG_BASE = 0x30
-MAX_BREAKPOINTS = 30
+from ps5debug import (CMD_ATTACH, CMD_BREAKPOINT, CMD_DETACH, EVENT_SIZE, MAX_BREAKPOINTS, REG,
+                      Link, find_title, regs)
 
 HOOKS = {
     "xk0AcarP3V4": "scePadOpen",
@@ -40,89 +30,6 @@ HOOKS = {
     "W2G-yoyMF5U": "scePadSetVibrationMode",
     "yFVnOdGxvZY": "scePadSetVibration",
 }
-
-
-class Link:
-    def __init__(self, host, port=744):
-        self.sock = socket.create_connection((host, port), timeout=10)
-
-    def recv(self, n):
-        out = bytearray()
-        while len(out) < n:
-            chunk = self.sock.recv(n - len(out))
-            if not chunk:
-                raise ConnectionError("console closed the connection")
-            out += chunk
-        return bytes(out)
-
-    def send(self, cmd, body=b""):
-        self.sock.sendall(struct.pack("<III", MAGIC, cmd, len(body)) + body)
-
-    def status(self):
-        return struct.unpack("<I", self.recv(4))[0]
-
-    def expect(self, what):
-        got = self.status()
-        if got != SUCCESS:
-            raise RuntimeError(f"{what}: status {got:#x}")
-
-    def processes(self):
-        self.send(CMD_PROC_LIST)
-        self.expect("proc list")
-        count, = struct.unpack("<I", self.recv(4))
-        data = self.recv(36 * count)
-        return [(data[i * 36:i * 36 + 32].split(b"\0")[0].decode("latin1"),
-                 struct.unpack_from("<i", data, i * 36 + 32)[0]) for i in range(count)]
-
-    def title_of(self, pid):
-        self.send(CMD_PROC_INFO, struct.pack("<I", pid))
-        if self.status() != SUCCESS:
-            return ""
-        data = self.recv(188)
-        return data[108:124].split(b"\0")[0].decode("latin1")
-
-    def maps(self, pid):
-        self.send(CMD_PROC_MAPS, struct.pack("<I", pid))
-        self.expect("proc maps")
-        count, = struct.unpack("<I", self.recv(4))
-        data = self.recv(58 * count)
-        out = []
-        for i in range(count):
-            name = data[i * 58:i * 58 + 32].split(b"\0")[0].decode("latin1")
-            start, end = struct.unpack_from("<QQ", data, i * 58 + 32)
-            out.append((name, start, end))
-        return out
-
-    def read(self, pid, address, length):
-        self.send(CMD_PROC_READ, struct.pack("<IQI", pid, address, length))
-        if self.status() != SUCCESS:
-            return None
-        return self.recv(length)
-
-    def write(self, pid, address, data):
-        self.send(CMD_PROC_WRITE, struct.pack("<IQI", pid, address, len(data)))
-        self.expect("write")
-        self.sock.sendall(data)
-        self.expect("write data")
-
-    def getregs(self, lwp):
-        self.send(CMD_GETREGS, struct.pack("<I", lwp))
-        self.expect("getregs")
-        return bytearray(self.recv(176))
-
-    def setregs(self, lwp, blob):
-        self.send(CMD_SETREGS, struct.pack("<II", lwp, len(blob)))
-        self.expect("setregs")
-        self.sock.sendall(bytes(blob))
-        self.expect("setregs data")
-
-    def breakpoint(self, index, address, enabled=1):
-        self.send(CMD_BREAKPOINT, struct.pack("<IIQ", index, enabled, address))
-        self.expect(f"breakpoint {index}")
-
-    def resume(self):
-        self.send(CMD_CONTINUE, struct.pack("<I", 0))
-        self.expect("continue")
 
 
 def default_lib():
@@ -146,26 +53,12 @@ def sdk_global(dump, offsets):
     return start + hit + 6 + struct.unpack_from("<i", code, hit + 2)[0]
 
 
-def find_title(link, title, stamp):
-    while True:
-        for name, pid in link.processes():
-            if name == "eboot.bin" and link.title_of(pid).startswith(title):
-                return pid
-        time.sleep(0.25)
-        if time.time() - stamp > 600:
-            sys.exit("title never appeared")
-
-
 def lib_base(link, pid, name="libScePad"):
     while True:
         starts = [s for n, s, _e in link.maps(pid) if name in n]
         if starts:
             return min(starts)
         time.sleep(0.05)
-
-
-def regs(event):
-    return {k: struct.unpack_from("<Q", event, REG_BASE + o)[0] for k, o in REG.items()}
 
 
 def describe(name, r, link, pid):

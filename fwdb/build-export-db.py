@@ -8,6 +8,9 @@
 #   build-export-db.py [options] PS5_LIBS_DIR
 #     -o, --out DIR     where to write the tables (default: ./docs)
 #     -n, --names FILE  a source of symbol names; repeatable, earlier files win
+#     -x, --extra-library NAME
+#                       also survey this library from system_ex/common_ex/lib;
+#                       repeatable (see WHICH LIBRARIES)
 #     -h, --help        this text
 #
 #   Names only label the tables; nothing matches on them. A NID is the first
@@ -38,8 +41,13 @@
 #   A dump is surveyed through the directory holding libkernel, since that is
 #   the set a PS4 title resolves against and no dump can omit it. Dumps disagree
 #   on where that lands - system/common/lib usually, a flat lib/ sometimes - and
-#   they also carry system_ex, priv and vsh libraries a title cannot link, so
-#   anchoring on libkernel is what makes them comparable.
+#   they also carry priv and vsh libraries a title cannot link, so anchoring on
+#   libkernel is what makes them comparable. A few libraries are added from
+#   system_ex/common_ex/lib, which titles do link (libScePosixForWebKit). Only
+#   the ones listed in COMMON_EX_LINKABLE, or given with -x, are taken: the rest
+#   of that directory is the shell UI and Mono images, about 1.5 million
+#   symbols no title imports. The PS4 stamp and module count in fw-levels.csv
+#   still come from the libkernel directory alone.
 #
 #   min_fw and max_fw are the first and last firmware seen exporting a symbol,
 #   so a dump that simply missed a module does not turn into a removal. Only a
@@ -68,6 +76,8 @@ def fw_key(name):
     return tuple(int(part) for part in name.split('.'))
 
 
+# Libraries taken from system_ex/common_ex/lib; see WHICH LIBRARIES above.
+COMMON_EX_LINKABLE = {'libScePosixForWebKit'}
 NID_SALT = bytes.fromhex('518D64A635DED8C1E6B039B1C3E55230')
 # Long enough to skip most noise, short enough to keep C++ manglings.
 STRING_TOKEN = re.compile(rb'[A-Za-z_][A-Za-z0-9_@$.]{3,399}')
@@ -129,6 +139,11 @@ def anchor_dir(firmware):
     return max(candidates, key=lambda d: sum(1 for _ in d.glob('*.sprx')))
 
 
+def extra_dirs(firmware):
+    """Linkable libraries outside the libkernel directory: system_ex/common_ex/lib."""
+    return sorted(d for d in firmware.rglob('common_ex/lib') if d.is_dir())
+
+
 def scan(directory):
     """-> (exports by library, module count, PS4 stamp, files by library)."""
     exports = defaultdict(set)
@@ -151,6 +166,7 @@ def scan(directory):
 
 def main(argv):
     out_dir, name_paths, roots = Path('docs'), [], []
+    linkable = set(COMMON_EX_LINKABLE)
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -168,6 +184,9 @@ def main(argv):
         elif arg in ('-n', '--names', '--nids'):
             i += 1
             name_paths.append(argv[i])
+        elif arg in ('-x', '--extra-library'):
+            i += 1
+            linkable.add(argv[i])
         elif arg.startswith('-'):
             die(f'unknown option: {arg}')
         else:
@@ -197,6 +216,11 @@ def main(argv):
             print(f'{firmware.name:>6}  no libkernel, skipped')
             continue
         exports, modules, stamp, files = scan(directory)
+        for extra in extra_dirs(firmware):
+            more_exports, _count, _stamp, more_files = scan(extra)
+            for library in linkable & more_exports.keys():
+                exports[library] |= more_exports[library]
+                files[library] |= more_files[library]
         for library, filenames in files.items():
             for filename in filenames:
                 carriers[(library, filename)].append(len(levels))

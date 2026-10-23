@@ -1,16 +1,18 @@
 """Acquire a title's executables into the cache and record its full file list.
 
-Loose dumps are walked (skipping sce_sys) and copied; packages are listed with
+Loose dumps are walked, including sce_sys, and copied; packages are listed with
 img_file_list and the executables pulled out one by one with img_extract. The
 full file list — executables and data alike — goes into files.csv next to the
-cache; case fixes need it. Read-only against the source; re-running skips
-files already cached at the same size.
+cache; case fixes need it. Read-only against the source; re-running replaces
+cached executables whose bytes changed.
 """
 import csv
+import filecmp
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from . import elf
@@ -53,6 +55,20 @@ def _append_manifest(cfg, title, kind, src_name, entries):
             w.writerow([title, kind, src_name, rel, os.path.getsize(dst), magic_of(dst)])
 
 
+def _prune_stale(root, keep):
+    for path in sorted((p for p in root.rglob("*") if p.is_file()), reverse=True):
+        if path == root / "files.csv":
+            continue
+        if path.relative_to(root) not in keep:
+            path.unlink()
+    for path in sorted((p for p in root.rglob("*") if p.is_dir()),
+                       key=lambda p: len(p.parts), reverse=True):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
 def acquire_loose(cfg, src, title=None):
     """Cache a loose dump. Returns the title's cache directory."""
     src = Path(src)
@@ -72,9 +88,13 @@ def acquire_loose(cfg, src, title=None):
                 continue
             dst = out / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            if not (dst.exists() and dst.stat().st_size == full.stat().st_size):
+            unchanged = (dst.exists()
+                         and dst.stat().st_size == full.stat().st_size
+                         and filecmp.cmp(full, dst, shallow=False))
+            if not unchanged:
                 shutil.copyfile(full, dst)
             entries.append((str(rel), dst))
+    _prune_stale(out, {Path(rel) for rel, _dst in entries})
     _write_file_list(out, rows)
     _append_manifest(cfg, title, "loose", src.name, entries)
     return out
@@ -92,6 +112,25 @@ def _pub(cfg, *args):
     env = dict(os.environ, WINEDEBUG="-all")
     return subprocess.run(_pub_argv(cfg, args), env=env,
                           capture_output=True, text=True, errors="replace", timeout=3600)
+
+
+def _extract_pkg_file(cfg, pkg, rel, dst):
+    fd, tmp_name = tempfile.mkstemp(prefix=dst.name + ".", dir=dst.parent)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    tmp.unlink()
+    try:
+        r = _pub(cfg, "img_extract", "--passcode", cfg.passcode,
+                 "--no_progress_bar", f"{pkg}:{rel}", str(tmp))
+        if not tmp.exists():
+            raise RuntimeError(f"extract failed: {rel}: {r.stdout[-200:]!r}")
+        if dst.exists() and filecmp.cmp(tmp, dst, shallow=False):
+            tmp.unlink()
+        else:
+            os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def acquire_pkg(cfg, pkg, title=None):
@@ -116,15 +155,12 @@ def acquire_pkg(cfg, pkg, title=None):
         raise RuntimeError(f"img_file_list gave no binaries (rc={r.returncode}): "
                            f"{r.stdout[-300:]!r} {r.stderr[-200:]!r}")
     entries = []
-    for size, rel in binaries:
+    for _size, rel in binaries:
         dst = out / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if not (dst.exists() and dst.stat().st_size == size):
-            r = _pub(cfg, "img_extract", "--passcode", cfg.passcode,
-                     "--no_progress_bar", f"{pkg}:{rel}", str(dst))
-            if not dst.exists():
-                raise RuntimeError(f"extract failed: {rel}: {r.stdout[-200:]!r}")
+        _extract_pkg_file(cfg, pkg, rel, dst)
         entries.append((rel, dst))
+    _prune_stale(out, {Path(rel) for rel, _dst in entries})
     _write_file_list(out, rows)
     _append_manifest(cfg, title, "pkg", pkg.name, entries)
     return out
@@ -139,12 +175,14 @@ def unwrap(cfg, title):
     """
     src, dst_root = cfg.cache / title, cfg.elf_cache / title
     stats, failures = {"elf": 0, "ok": 0, "ok-noparam": 0}, []
+    keep = set()
     for root, _dirs, files in os.walk(src):
         for name in sorted(files):
             if name == "files.csv":
                 continue
             full = Path(root) / name
             rel = full.relative_to(src)
+            keep.add(rel)
             dst = dst_root / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.exists():
@@ -158,4 +196,6 @@ def unwrap(cfg, title):
                 stats["ok" if elf.read(dst) else "ok-noparam"] += 1
             except Exception as e:
                 failures.append((str(rel), str(e)))
+    if dst_root.exists():
+        _prune_stale(dst_root, keep)
     return stats, failures

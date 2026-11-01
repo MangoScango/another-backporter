@@ -391,6 +391,7 @@ class Patcher:
 
         source is vrr_shim.s; both wrappers unpeg the output for VRR-aware apps.
         """
+        import shutil
         import subprocess
         import tempfile
         add_event = self.export_address("libSceVideoOutVrrStatus", "LibwuIonIBw")
@@ -414,11 +415,20 @@ class Patcher:
         peg = self.export_address("libSceVideoOutVrrPeg", "5tRaBjtdTzY")
         syms = dict(add_event=add_event, get_vrr=get_vrr, peg=peg, unpeg=unpeg,
                     aware_flag=aware_flag, peg_flag=peg_flag)
+        defsyms = [f"--defsym={k}={v:#x}" for k, v in syms.items()]
         with tempfile.TemporaryDirectory() as tmp:
-            obj, out, mapf = f"{tmp}/s.o", f"{tmp}/s.bin", f"{tmp}/s.map"
-            subprocess.run(["clang", "-c", "--target=x86_64-unknown-elf", "-o", obj, source], check=True)
-            subprocess.run(["ld.lld", "-o", out, "--oformat=binary", "--image-base=0", f"-Ttext={base:#x}", "-e", "0",
-                            "-Map", mapf, *[f"--defsym={k}={v:#x}" for k, v in syms.items()], obj], check=True)
+            obj, elf, out, mapf = f"{tmp}/s.o", f"{tmp}/s.elf", f"{tmp}/s.bin", f"{tmp}/s.map"
+            if shutil.which("clang") and shutil.which("ld.lld"):
+                subprocess.run(["clang", "-c", "--target=x86_64-unknown-elf", "-o", obj, source], check=True)
+                subprocess.run(["ld.lld", "-o", out, "--oformat=binary", "--image-base=0", f"-Ttext={base:#x}", "-e", "0",
+                                "-Map", mapf, *defsyms, obj], check=True)
+            else:
+                # Minimal containers (e.g. the unified-fpkger image) ship binutils
+                # but not clang/lld; GNU as/ld produce the same flat blob.
+                subprocess.run(["as", "--64", "-o", obj, source], check=True)
+                subprocess.run(["ld", "-o", elf, f"-Ttext={base:#x}", "-e", "0",
+                                "-Map", mapf, *defsyms, obj], check=True)
+                subprocess.run(["objcopy", "-O", "binary", "--only-section=.text", elf, out], check=True)
             blob = open(out, "rb").read()
             entries = {}
             for line in open(mapf):
